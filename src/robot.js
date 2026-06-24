@@ -4,9 +4,56 @@ const XLSX = require('xlsx');
 const { chromium } = require('playwright');
 
 const REPORT_DIR = path.resolve(process.env.REPORT_DIR || './relatorios');
-const DEMO_MODE = String(process.env.DEMO_MODE || 'true').toLowerCase() === 'true';
+const DEMO_MODE = String(process.env.DEMO_MODE || 'false').toLowerCase() === 'true';
 const HEADLESS = String(process.env.HEADLESS || 'true').toLowerCase() !== 'false';
 const LINHAS_POR_PAGINA = Number(process.env.LINHAS_POR_PAGINA || 3000);
+
+// Modelo oficial confirmado pelo relatório exportado pelo FloraGold.
+// O backend preserva essas colunas e falha se o exportador não trouxer esse conjunto básico.
+const OFFICIAL_HEADERS = ['Protocolo', 'Status', 'Origem', 'Data', 'Hora', 'Fila', 'Destino', 'Operador', 'Conversa', 'Espera', 'Duracao'];
+
+function normalizeHeaderKey(value) {
+  return String(value || '')
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/\s+/g, '')
+    .toLowerCase();
+}
+
+function findHeader(headers, expected) {
+  const expectedKey = normalizeHeaderKey(expected);
+  return (headers || []).find(h => normalizeHeaderKey(h) === expectedKey);
+}
+
+function alignRowsToOfficialSchema(rows, headers) {
+  const headerMap = {};
+  for (const expected of OFFICIAL_HEADERS) {
+    const found = findHeader(headers, expected);
+    if (!found) return { ok: false, missing: expected, rows, headers };
+    headerMap[expected] = found;
+  }
+
+  const aligned = (rows || []).map(row => {
+    const out = {};
+    for (const expected of OFFICIAL_HEADERS) out[expected] = row[headerMap[expected]] ?? '';
+    for (const h of headers || []) {
+      if (!Object.values(headerMap).includes(h) && !(h in out)) out[h] = row[h] ?? '';
+    }
+    return out;
+  });
+
+  const extraHeaders = (headers || []).filter(h => !Object.values(headerMap).includes(h));
+  return { ok: true, rows: aligned, headers: [...OFFICIAL_HEADERS, ...extraHeaders] };
+}
+
+function validateOfficialReportSchema(rows, headers, context = 'relatório') {
+  const aligned = alignRowsToOfficialSchema(rows, headers);
+  if (!aligned.ok) {
+    throw new Error(`O ${context} exportado não bate com o modelo oficial do FloraGold. Coluna ausente: ${aligned.missing}. O robô não vai gerar relatório incompleto.`);
+  }
+  return aligned;
+}
+
 
 function envList(name, fallback) {
   const raw = process.env[name];
@@ -152,6 +199,20 @@ const SELECTORS = {
     '.paginate_button.next:not(.disabled)',
     '.pagination .next:not(.disabled) a',
     '.pagination .next:not(.disabled) button'
+  ]),
+  exportExcelButton: envSelector('EXPORT_EXCEL_SELECTOR', [
+    '.buttons-excel',
+    'button:has-text("Excel")',
+    'a:has-text("Excel")',
+    '[title*="Excel"]',
+    'button:has-text("XLS")',
+    'a:has-text("XLS")'
+  ]),
+  exportCsvButton: envSelector('EXPORT_CSV_SELECTOR', [
+    '.buttons-csv',
+    'button:has-text("CSV")',
+    'a:has-text("CSV")',
+    '[title*="CSV"]'
   ])
 };
 
@@ -257,6 +318,14 @@ function saveFiles({ rows, headers, filenameBase }) {
 
   if (!headers?.length && rows[0]) headers = Object.keys(rows[0]);
   if (!headers?.length) headers = ['Resultado'];
+
+  // Se for relatório com modelo oficial, grava na ordem exata do FloraGold.
+  const official = alignRowsToOfficialSchema(rows, headers);
+  if (official.ok) {
+    rows = official.rows;
+    headers = official.headers;
+  }
+
 
   const csvFile = `${filenameBase}.csv`;
   const xlsxFile = `${filenameBase}.xlsx`;
@@ -379,7 +448,12 @@ function demoOptions() {
 }
 
 async function runReportJob(params, update = () => {}) {
-  if (DEMO_MODE) return runDemoJob(params, update);
+  // v11: relatório verídico obrigatório.
+  // DEMO_MODE=true serve apenas para testar conexão/validação visual, não para gerar arquivo,
+  // porque dados simulados podem confundir telefone/protocolo/origem.
+  if (DEMO_MODE) {
+    throw new Error('DEMO_MODE=true está ativo. Para gerar relatório verídico, altere DEMO_MODE=false no Render. Nenhum dado simulado será gerado.');
+  }
   return runRealJob(params, update);
 }
 
@@ -452,10 +526,27 @@ async function runRealJob(params, update) {
     update({ step: 'Filtros aplicados', progress: 45, log: 'Filtros aplicados.' });
 
     await setRowsPerPage(page, LINHAS_POR_PAGINA);
-    const { rows, headers, paginasCapturadas, totalExpected } = await captureAllPages(page, update, started);
+
+    // v9: por padrão usamos o exportador NATIVO do FloraGold após aplicar os filtros.
+    // Isso evita relatório "meia boca": o arquivo final passa a usar as mesmas colunas
+    // que o sistema exporta no botão Excel/CSV, em vez de depender só das colunas visíveis da tabela.
+    const exportMode = String(process.env.EXPORT_MODE || 'native').toLowerCase();
+    const captured = exportMode === 'table'
+      ? await captureAllPages(page, update, started)
+      : await exportNativeFilteredReport(page, update, started);
+
+    let { rows, headers, paginasCapturadas, totalExpected, sourceMode } = captured;
 
     if (!rows.length) {
-      throw new Error('Nenhuma linha capturada. Verifique período, filtro, permissões ou seletores do sistema.');
+      throw new Error('Nenhuma linha capturada. Verifique se o filtro de período foi aplicado e se o botão Excel/CSV do sistema exportou dados.');
+    }
+
+    // v10: proteção contra relatório incompleto.
+    // O arquivo final só é gerado se o exportador nativo trouxer as colunas do relatório oficial FloraGold.
+    if (normalizeText(params.tipoRelatorio || 'Entrante').includes('entrant')) {
+      const official = validateOfficialReportSchema(rows, headers, 'relatório Entrante');
+      rows = official.rows;
+      headers = official.headers;
     }
 
     const base = `relatorio_${slug(params.tipoRelatorio || 'entrante')}_${parseDateBR(params.dataInicial)}_${parseDateBR(params.dataFinal)}_${Date.now()}`;
@@ -466,6 +557,7 @@ async function runRealJob(params, update) {
       registrosCapturados: rows.length,
       paginasCapturadas,
       tempoTotal: elapsed(started),
+      modoCaptura: sourceMode || exportMode,
       ...files,
       demoMode: false
     };
@@ -814,6 +906,207 @@ async function setRowsPerPage(page, rowsPerPage) {
     }
   }
   return false;
+}
+
+
+function normalizeHeaderName(value, index) {
+  const clean = String(value || '').replace(/\s+/g, ' ').trim();
+  return clean || `Coluna ${index + 1}`;
+}
+
+function normalizeRowsFromSheet(matrix) {
+  const cleanRows = (matrix || [])
+    .map(r => (r || []).map(c => String(c ?? '').replace(/\s+/g, ' ').trim()))
+    .filter(r => r.length && r.some(c => c));
+
+  if (!cleanRows.length) return { headers: [], rows: [] };
+
+  let headerIndex = 0;
+  // Procura uma linha provável de cabeçalho. Relatórios exportados às vezes têm título nas primeiras linhas.
+  for (let i = 0; i < Math.min(8, cleanRows.length); i++) {
+    const joined = cleanRows[i].join(' ').toLowerCase();
+    const filled = cleanRows[i].filter(Boolean).length;
+    if (filled >= 2 && /(data|hora|operador|origem|destino|status|protocolo|fila|duração|duracao|espera)/i.test(joined)) {
+      headerIndex = i;
+      break;
+    }
+  }
+
+  const headers = cleanRows[headerIndex].map(normalizeHeaderName);
+  const rows = cleanRows.slice(headerIndex + 1)
+    .filter(r => r.some(c => c) && !/total geral|nenhum registro|no matching records/i.test(r.join(' ')))
+    .map(r => {
+      const obj = {};
+      headers.forEach((h, i) => { obj[h] = r[i] || ''; });
+      return obj;
+    });
+
+  return { headers, rows };
+}
+
+function parseDownloadedFile(filePath) {
+  const ext = path.extname(filePath).toLowerCase();
+
+  if (['.xlsx', '.xls', '.xlsm', '.ods'].includes(ext)) {
+    const wb = XLSX.readFile(filePath, { cellDates: false, raw: false });
+    const sheetName = wb.SheetNames[0];
+    const matrix = XLSX.utils.sheet_to_json(wb.Sheets[sheetName], { header: 1, defval: '' });
+    return normalizeRowsFromSheet(matrix);
+  }
+
+  const raw = fs.readFileSync(filePath, 'utf8').replace(/^\uFEFF/, '');
+  const lines = raw.split(/\r?\n/).filter(Boolean);
+  const sep = raw.includes(';') ? ';' : ',';
+  const matrix = lines.map(line => {
+    // Parser simples suficiente para CSV do sistema; se houver aspas, respeita o básico.
+    const out = [];
+    let cur = '';
+    let quoted = false;
+    for (let i = 0; i < line.length; i++) {
+      const ch = line[i];
+      if (ch === '"' && line[i + 1] === '"') { cur += '"'; i++; continue; }
+      if (ch === '"') { quoted = !quoted; continue; }
+      if (ch === sep && !quoted) { out.push(cur); cur = ''; continue; }
+      cur += ch;
+    }
+    out.push(cur);
+    return out;
+  });
+  return normalizeRowsFromSheet(matrix);
+}
+
+async function clickExportButtonAndWaitDownload(pageOrFrame, label = 'Excel/CSV') {
+  const candidates = [...SELECTORS.exportExcelButton, ...SELECTORS.exportCsvButton];
+  for (const selector of candidates.filter(Boolean)) {
+    const loc = pageOrFrame.locator(selector).first();
+    const count = await loc.count().catch(() => 0);
+    if (!count) continue;
+    const visible = await loc.isVisible().catch(() => true);
+    if (!visible) continue;
+
+    const downloadPromise = pageOrFrame.page ? pageOrFrame.page().waitForEvent('download', { timeout: 45000 }) : null;
+    // Quando pageOrFrame é Page, não existe .page().
+    const realPromise = downloadPromise || pageOrFrame.waitForEvent('download', { timeout: 45000 });
+    await loc.click({ timeout: 12000 });
+    const download = await realPromise;
+    return download;
+  }
+  throw new Error(`Não encontrei o botão de exportação ${label}. Ajuste EXPORT_EXCEL_SELECTOR ou EXPORT_CSV_SELECTOR no Render.`);
+}
+
+async function getPageTotals(page) {
+  for (const frame of page.frames()) {
+    const totals = await frame.evaluate((linhasPorPagina) => {
+      const text = el => (el?.innerText || el?.textContent || '').replace(/\s+/g, ' ').trim();
+      const body = text(document.body);
+      const parseNumber = v => Number(String(v || '').replace(/\./g, '').replace(',', '.').replace(/[^0-9.]/g, '')) || 0;
+      let totalRecords = 0;
+      const patterns = [
+        /de\s+([\d\.]+)\s+registros/i,
+        /total\s+de\s+([\d\.]+)\s+registros/i,
+        /([\d\.]+)\s+registros\s+no\s+total/i,
+        /filtered\s+from\s+([\d\.]+)\s+total/i
+      ];
+      for (const p of patterns) {
+        const m = body.match(p);
+        if (m) { totalRecords = parseNumber(m[1]); break; }
+      }
+
+      let totalPages = totalRecords ? Math.max(1, Math.ceil(totalRecords / linhasPorPagina)) : 0;
+      const pageNumbers = Array.from(document.querySelectorAll('.paginate_button, .pagination a, .pagination button, a, button'))
+        .map(el => text(el))
+        .filter(v => /^\d+$/.test(v))
+        .map(Number);
+      if (pageNumbers.length) totalPages = Math.max(totalPages, Math.max(...pageNumbers));
+      return { totalRecords, totalPages };
+    }, LINHAS_POR_PAGINA).catch(() => ({ totalRecords: 0, totalPages: 0 }));
+    if (totals.totalRecords || totals.totalPages) return totals;
+  }
+  return { totalRecords: 0, totalPages: 0 };
+}
+
+async function exportNativeFilteredReport(page, update, started = Date.now()) {
+  fs.mkdirSync(REPORT_DIR, { recursive: true });
+
+  const allRows = [];
+  let headers = [];
+  const seen = new Set();
+  let paginasCapturadas = 0;
+  let { totalRecords, totalPages } = await getPageTotals(page);
+
+  update({
+    step: totalPages ? `Exportando arquivo do sistema 1 de ${totalPages}` : 'Exportando arquivo do sistema',
+    progress: 48,
+    paginaAtual: 1,
+    totalPaginas: totalPages || 0,
+    registrosLidos: 0,
+    log: 'Usando botão nativo Excel/CSV do FloraGold para manter o relatório completo.'
+  });
+
+  for (let p = 1; p <= 250; p++) {
+    const source = await bestTableSource(page);
+    const frame = source?.frame || page.mainFrame();
+
+    const download = await clickExportButtonAndWaitDownload(frame, 'Excel/CSV');
+    const suggested = download.suggestedFilename() || `floragold_pagina_${p}.xlsx`;
+    const tmpFile = path.join(REPORT_DIR, `tmp_${Date.now()}_${p}_${slug(suggested) || 'export'}`);
+    await download.saveAs(tmpFile);
+
+    let parsed = parseDownloadedFile(tmpFile);
+    fs.unlink(tmpFile, () => {});
+
+    // Valida e ordena pelo modelo oficial do FloraGold.
+    // Assim não aceitamos planilha resumida ou tabela visual com colunas faltando.
+    if (parsed.headers?.length) {
+      const official = validateOfficialReportSchema(parsed.rows, parsed.headers, `arquivo nativo página ${p}`);
+      parsed = { headers: official.headers, rows: official.rows };
+    }
+
+    if (!headers.length && parsed.headers.length) headers = parsed.headers;
+
+    let added = 0;
+    for (const row of parsed.rows) {
+      const key = headers.map(h => row[h] || '').join('||') || JSON.stringify(row);
+      if (seen.has(key)) continue;
+      seen.add(key);
+      allRows.push(row);
+      added++;
+    }
+
+    paginasCapturadas = p;
+    const totals = await getPageTotals(page);
+    if (totals.totalPages) totalPages = totals.totalPages;
+    if (totals.totalRecords) totalRecords = totals.totalRecords;
+
+    update({
+      step: totalPages ? `Exportando arquivo do sistema ${p} de ${totalPages}` : `Exportando arquivo do sistema ${p}`,
+      progress: totalPages ? Math.min(94, 48 + Math.round((p / totalPages) * 44)) : Math.min(92, 48 + p * 2),
+      paginaAtual: p,
+      totalPaginas: totalPages || 0,
+      registrosLidos: allRows.length,
+      linhasPorPagina: LINHAS_POR_PAGINA,
+      velocidadeMedia: averagePageSpeed(started, p),
+      tempoEstimadoRestante: totalPages ? estimateRemaining(started, p, totalPages) : '--',
+      log: `Exportação nativa ${p}${totalPages ? ` de ${totalPages}` : ''}: ${added} linhas importadas do arquivo do sistema.`
+    });
+
+    // Se o botão nativo exportou tudo filtrado de uma vez, não precisa passar páginas.
+    if (totalRecords && allRows.length >= totalRecords) break;
+    if (totalPages && p >= totalPages) break;
+
+    const moved = await clickNext(frame);
+    if (!moved) break;
+    await waitProcessingAfterNext(page);
+  }
+
+  if (!headers.length && allRows[0]) headers = Object.keys(allRows[0]);
+  return { rows: allRows, headers, paginasCapturadas, totalExpected: totalRecords || allRows.length, sourceMode: 'native-export' };
+}
+
+async function waitProcessingAfterNext(page) {
+  await page.waitForLoadState('networkidle', { timeout: 45000 }).catch(() => {});
+  await waitForProcessingEnd(page).catch(() => {});
+  await sleep(1000);
 }
 
 async function captureAllPages(page, update, started = Date.now()) {
