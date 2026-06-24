@@ -21,6 +21,25 @@ const HISTORY_PATH = path.join(REPORT_DIR, 'historico.json');
 const JOB_TTL_MINUTES = Number(process.env.JOB_TTL_MINUTES || 180);
 const LINHAS_POR_PAGINA = Number(process.env.LINHAS_POR_PAGINA || 3000);
 
+function normalizeDateOnly(value) {
+  const raw = String(value || '').trim();
+  if (!raw) return '';
+  // Frontend novo envia YYYY-MM-DD. O FloraGold costuma usar DD/MM/AAAA.
+  const iso = raw.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (iso) return `${iso[3]}/${iso[2]}/${iso[1]}`;
+  return raw;
+}
+
+function normalizeParams(params = {}) {
+  return {
+    ...params,
+    dataInicial: normalizeDateOnly(params.dataInicial),
+    dataFinal: normalizeDateOnly(params.dataFinal),
+    horaInicial: '00:00',
+    horaFinal: '23:59'
+  };
+}
+
 fs.mkdirSync(REPORT_DIR, { recursive: true });
 fs.mkdirSync(path.join(REPORT_DIR, 'erros'), { recursive: true });
 
@@ -91,7 +110,7 @@ function cleanOldJobs() {
 setInterval(cleanOldJobs, 15 * 60 * 1000).unref();
 
 function validateParams(params) {
-  const required = ['usuario', 'senha', 'tipoRelatorio', 'dataInicial', 'horaInicial', 'dataFinal', 'horaFinal'];
+  const required = ['usuario', 'senha', 'tipoRelatorio', 'dataInicial', 'dataFinal'];
   const missing = required.filter(key => !String(params?.[key] || '').trim());
   if (missing.length) return `Campos obrigatórios ausentes: ${missing.join(', ')}`;
   return null;
@@ -102,7 +121,7 @@ function historySuccess(job, result) {
   return {
     id: job.id,
     tipoRelatorio: p.tipoRelatorio,
-    periodo: `${p.dataInicial} ${p.horaInicial} até ${p.dataFinal} ${p.horaFinal}`,
+    periodo: `${p.dataInicial} até ${p.dataFinal}`,
     operador: p.operador || 'Todos os operadores',
     fila: p.fila || 'Todas as filas',
     statusFiltro: p.statusFiltro || p.status || 'Todos os status',
@@ -121,7 +140,7 @@ function historyError(job, err) {
   return {
     id: job.id,
     tipoRelatorio: p.tipoRelatorio || 'Relatório',
-    periodo: `${p.dataInicial || ''} ${p.horaInicial || ''} até ${p.dataFinal || ''} ${p.horaFinal || ''}`.trim(),
+    periodo: `${p.dataInicial || ''} até ${p.dataFinal || ''}`.trim(),
     operador: p.operador || 'Todos os operadores',
     fila: p.fila || 'Todas as filas',
     registros: 0,
@@ -155,7 +174,7 @@ app.delete('/api/historico', (req, res) => {
 });
 
 app.post('/api/validar-acesso', async (req, res) => {
-  const params = req.body || {};
+  const params = normalizeParams(req.body || {});
   if (!params.usuario || !params.senha) {
     return res.status(400).json({ ok: false, error: 'Informe usuário e senha.' });
   }
@@ -169,7 +188,7 @@ app.post('/api/validar-acesso', async (req, res) => {
 });
 
 app.post('/api/opcoes', async (req, res) => {
-  const params = req.body || {};
+  const params = normalizeParams(req.body || {});
   try {
     const result = await readFilterOptionsJob(params);
     res.json({ ok: true, result });
@@ -179,7 +198,7 @@ app.post('/api/opcoes', async (req, res) => {
 });
 
 app.post('/api/relatorios/gerar', (req, res) => {
-  const params = req.body || {};
+  const params = normalizeParams(req.body || {});
   const error = validateParams(params);
   if (error) return res.status(400).json({ ok: false, error });
 

@@ -692,17 +692,7 @@ async function fillDateRange(page, selectors, value, label) {
 }
 
 async function fillTimeFields(page, params) {
-  const startSet = await fillFirst(page, SELECTORS.startTime, params.horaInicial, 'hora inicial', { optional: true });
-  const endSet = await fillFirst(page, SELECTORS.endTime, params.horaFinal, 'hora final', { optional: true, skipFirstMatchIfSame: startSet?.selector });
-
-  if (!startSet || !endSet) {
-    const inputs = page.locator('.modal input[type="time"], input[type="time"], input[placeholder="HH:MM"], input[name*="hora"]');
-    const count = await inputs.count().catch(() => 0);
-    if (count >= 2) {
-      await inputs.nth(0).fill(params.horaInicial).catch(() => {});
-      await inputs.nth(1).fill(params.horaFinal).catch(() => {});
-    }
-  }
+  // Não preenchemos filtro de hora separado. O período já é enviado como dia completo (00:00 até 23:59).
 }
 
 async function selectIfPresent(page, selectors, value, ignored = []) {
