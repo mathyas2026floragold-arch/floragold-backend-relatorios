@@ -1,0 +1,7 @@
+node_modules/
+.env
+relatorios/*.csv
+relatorios/*.xlsx
+relatorios/*.json
+relatorios/erros/
+playwright-report/
