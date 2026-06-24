@@ -116,6 +116,13 @@ const SELECTORS = {
     'button:has-text("Retirar pausa")',
     'a:has-text("Retirar pausa")'
   ]),
+  confirmPauseButton: envSelector('CONFIRM_PAUSE_SELECTOR', [
+    'button:has-text("Confirmar")',
+    'button:has-text("Sim")',
+    'button:has-text("OK")',
+    '.modal button.btn-primary',
+    '.swal2-confirm'
+  ]),
   pauseReasonSelect: envSelector('PAUSE_REASON_SELECTOR', [
     'select:has(option:text("Ligação 0800"))',
     'select:has(option:text("Ligacao 0800"))',
@@ -410,7 +417,7 @@ async function validateAccessJob(params) {
   const { browser, page } = await launchBrowser();
   try {
     await login(page, params);
-    const safety = await ensureSafety(page, null, { validateOnly: true });
+    const safety = await ensureSafety(page, null, { validateOnly: false });
     return { ...safety, message: 'Acesso validado no sistema real.' };
   } finally {
     await browser.close();
@@ -669,6 +676,7 @@ async function readSafety(page) {
 async function selectPause0800(page) {
   const reason = process.env.PAUSE_REASON_LABEL || 'Ligação 0800';
 
+  // Primeiro tenta por select nativo. Pelo print, "Ligação 0800" fica em um select antes do botão amarelo.
   for (const selector of SELECTORS.pauseReasonSelect.filter(Boolean)) {
     const loc = page.locator(selector).first();
     const count = await loc.count().catch(() => 0);
@@ -676,38 +684,114 @@ async function selectPause0800(page) {
 
     try {
       await loc.selectOption({ label: reason });
-      await sleep(400);
-      return true;
+      await sleep(500);
+      return { ok: true, mode: 'select-label', selector };
     } catch {}
 
     try {
-      await loc.selectOption(reason);
-      await sleep(400);
-      return true;
+      await loc.selectOption({ label: 'Ligacao 0800' });
+      await sleep(500);
+      return { ok: true, mode: 'select-label-sem-acento', selector };
+    } catch {}
+
+    try {
+      await loc.evaluate((el, wanted) => {
+        const clean = v => String(v || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase();
+        const opt = Array.from(el.options || []).find(o => clean(o.textContent).includes(clean(wanted)));
+        if (opt) {
+          el.value = opt.value;
+          el.dispatchEvent(new Event('input', { bubbles: true }));
+          el.dispatchEvent(new Event('change', { bubbles: true }));
+        }
+      }, reason);
+      await sleep(500);
+      return { ok: true, mode: 'select-evaluate', selector };
     } catch {}
   }
 
-  // Fallback para selects customizados: tenta clicar no texto se ele aparecer.
+  // Fallback para dropdown customizado.
   await page.getByText(reason, { exact: false }).first().click({ timeout: 3000 }).catch(() => null);
-  await sleep(400);
-  return true;
+  await sleep(500);
+  return { ok: true, mode: 'text-click' };
+}
+
+async function clickPauseButtonNearReason(page) {
+  // Preferência: clicar no botão amarelo do mesmo bloco/linha do select onde existe "Ligação 0800".
+  const clicked = await page.evaluate(() => {
+    const norm = v => String(v || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase();
+    const visible = el => !!(el && el.getClientRects().length);
+    const selects = Array.from(document.querySelectorAll('select')).filter(visible);
+
+    for (const sel of selects) {
+      const has0800 = Array.from(sel.options || []).some(o => norm(o.textContent).includes('ligacao 0800'));
+      if (!has0800) continue;
+
+      let root = sel.parentElement;
+      for (let depth = 0; root && depth < 5; depth++, root = root.parentElement) {
+        const buttons = Array.from(root.querySelectorAll('button,a,input[type="button"],input[type="submit"]')).filter(visible);
+        const target = buttons.find(btn => {
+          const txt = norm(btn.innerText || btn.textContent || btn.title || btn.getAttribute('aria-label') || btn.value || '');
+          const cls = norm(btn.className || '');
+          return txt.includes('iniciar pausa') || txt.includes('pausa') || cls.includes('btn-warning') || cls.includes('warning');
+        }) || buttons.find(btn => norm(btn.className || '').includes('warning'));
+        if (target) {
+          target.click();
+          return true;
+        }
+      }
+    }
+    return false;
+  }).catch(() => false);
+
+  if (clicked) {
+    await sleep(800);
+    return true;
+  }
+
+  return clickFirst(page, SELECTORS.pauseButton, 'botão Iniciar pausa');
+}
+
+async function confirmPauseIfPrompt(page) {
+  // Alguns sistemas abrem modal de confirmação depois de clicar em iniciar pausa.
+  await sleep(700);
+  for (const selector of SELECTORS.confirmPauseButton.filter(Boolean)) {
+    const loc = page.locator(selector).first();
+    const count = await loc.count().catch(() => 0);
+    if (!count) continue;
+    const visible = await loc.isVisible().catch(() => false);
+    if (!visible) continue;
+    await loc.click({ timeout: 5000 }).catch(() => null);
+    await sleep(1000);
+    return true;
+  }
+  return false;
 }
 
 async function activatePause0800(page, update = null) {
   update?.({ step: 'Ativando pausa 0800', progress: 20, log: 'Selecionando Ligação 0800 e clicando em Iniciar pausa.' });
 
+  const before = await readSafety(page);
+  if (before.pausa0800 && !before.ligacaoAtiva) return before;
+
   await selectPause0800(page);
-  await clickFirst(page, SELECTORS.pauseButton, 'botão Iniciar pausa');
+  await clickPauseButtonNearReason(page);
+  await confirmPauseIfPrompt(page);
 
   const started = Date.now();
-  while (Date.now() - started < 30000) {
-    await sleep(1200);
+  while (Date.now() - started < 45000) {
+    await sleep(1500);
     const safety = await readSafety(page);
+    update?.({
+      step: 'Aguardando confirmação da pausa 0800',
+      progress: 22,
+      statusOperador: safety.statusOperador,
+      log: `Status detectado: ${safety.statusOperador}`
+    });
     if (safety.pausa0800 && !safety.ligacaoAtiva) return safety;
   }
 
   const safety = await readSafety(page);
-  throw new Error(`Não foi possível confirmar a pausa 0800. Status detectado: ${safety.statusOperador}`);
+  throw new Error(`Não foi possível confirmar a pausa 0800. Status detectado: ${safety.statusOperador}. Verifique se o botão Iniciar pausa abriu confirmação ou se o seletor PAUSE_BUTTON_SELECTOR precisa ser ajustado.`);
 }
 
 async function ensureSafety(page, update = null, options = {}) {
