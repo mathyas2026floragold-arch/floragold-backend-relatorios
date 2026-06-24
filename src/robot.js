@@ -173,6 +173,35 @@ function parseDateBR(date) {
   return `${y || '0000'}-${m || '00'}-${d || '00'}`;
 }
 
+function dateBRToDate(date) {
+  const [d, m, y] = String(date || '').split('/').map(Number);
+  if (!d || !m || !y) return null;
+  return new Date(y, m - 1, d);
+}
+
+function daysBetweenBR(start, end) {
+  const a = dateBRToDate(start);
+  const b = dateBRToDate(end);
+  if (!a || !b) return 1;
+  return Math.max(1, Math.floor((b - a) / 86400000) + 1);
+}
+
+function addDays(date, days) {
+  const d = new Date(date.getTime());
+  d.setDate(d.getDate() + days);
+  return d;
+}
+
+function formatDateBR(date) {
+  return `${String(date.getDate()).padStart(2, '0')}/${String(date.getMonth() + 1).padStart(2, '0')}/${date.getFullYear()}`;
+}
+
+function demoTotalForRange(params) {
+  const days = daysBetweenBR(params.dataInicial, params.dataFinal);
+  const basePerDay = Number(process.env.DEMO_REGISTROS_POR_DIA || 135);
+  return Math.max(1, Math.min(61358, days * basePerDay));
+}
+
 function elapsed(start) {
   const seconds = Math.floor((Date.now() - start) / 1000);
   return formatDuration(seconds);
@@ -249,12 +278,15 @@ function saveFiles({ rows, headers, filenameBase }) {
   return { csvFile, xlsxFile, csvPath, xlsxPath };
 }
 
-function buildDemoRows(params, total = 61358) {
+function buildDemoRows(params, total = demoTotalForRange(params)) {
   const operadores = ['Ismaias Mathyas', 'Jailson Maceno', 'Midian Silva', 'Vinicius Araújo', 'Kayki Lima', 'Amanda Franciele', 'Rennan Victor', 'Genilson Luz'];
   const statusList = ['Atendida', 'Atendida', 'Atendida', 'Abandono'];
   const filas = ['rcpt0800', '0800', 'Atendimento', 'Equipe 1'];
   const ddds = ['82', '81', '91', '83', '68', '97', '65', '28'];
   const rows = [];
+
+  const startDate = dateBRToDate(params.dataInicial) || new Date();
+  const days = daysBetweenBR(params.dataInicial, params.dataFinal);
 
   for (let i = 1; i <= total; i++) {
     const operador = params.operador && !String(params.operador).includes('Todos') ? params.operador : operadores[i % operadores.length];
@@ -266,7 +298,7 @@ function buildDemoRows(params, total = 61358) {
       Protocolo: `ENT-${String(i).padStart(7, '0')}`,
       Status: status,
       Origem: `(${ddd}) 9${String(80000000 + i).slice(-8)}`,
-      Data: params.dataInicial,
+      Data: formatDateBR(addDays(startDate, (i - 1) % days)),
       Hora: `${String(8 + (i % 12)).padStart(2, '0')}:${String(i % 60).padStart(2, '0')}:${String((i * 7) % 60).padStart(2, '0')}`,
       Fila: fila,
       Destino: String(1000 + (i % 30)),
@@ -365,8 +397,8 @@ async function runDemoJob(params, update) {
     update({ step, progress, log: step });
   }
 
-  const totalRegistros = 61358;
-  const paginas = Math.ceil(totalRegistros / LINHAS_POR_PAGINA);
+  const totalRegistros = demoTotalForRange(params);
+  const paginas = Math.max(1, Math.ceil(totalRegistros / LINHAS_POR_PAGINA));
 
   for (let p = 1; p <= paginas; p++) {
     await sleep(120);
@@ -420,7 +452,7 @@ async function runRealJob(params, update) {
     update({ step: 'Filtros aplicados', progress: 45, log: 'Filtros aplicados.' });
 
     await setRowsPerPage(page, LINHAS_POR_PAGINA);
-    const { rows, headers, paginasCapturadas } = await captureAllPages(page, update, started);
+    const { rows, headers, paginasCapturadas, totalExpected } = await captureAllPages(page, update, started);
 
     if (!rows.length) {
       throw new Error('Nenhuma linha capturada. Verifique período, filtro, permissões ou seletores do sistema.');
@@ -430,7 +462,8 @@ async function runRealJob(params, update) {
     const files = saveFiles({ rows, headers, filenameBase: base });
 
     return {
-      totalRegistros: rows.length,
+      totalRegistros: totalExpected || rows.length,
+      registrosCapturados: rows.length,
       paginasCapturadas,
       tempoTotal: elapsed(started),
       ...files,
@@ -643,9 +676,12 @@ async function openFilters(page) {
 }
 
 async function applyFilters(page, params) {
+  const beforeSignature = await readTableSignature(page).catch(() => '');
   await openFilters(page);
 
-  const periodo = `${params.dataInicial} ${params.horaInicial} - ${params.dataFinal} ${params.horaFinal}`;
+  // Regra v8: o relatório SEMPRE precisa ser filtrado pelo período escolhido.
+  // A interface só envia data inicial e data final; não há filtro de horário no HTML.
+  const periodo = `${params.dataInicial} - ${params.dataFinal}`;
 
   if (SELECTORS.startDate.length && SELECTORS.endDate.length) {
     await fillFirst(page, SELECTORS.startDate, params.dataInicial, 'data inicial').catch(() => null);
@@ -671,7 +707,60 @@ async function applyFilters(page, params) {
 
   await clickFirst(page, SELECTORS.searchButton, 'botão Buscar/Pesquisar');
   await page.waitForLoadState('networkidle', { timeout: 70000 }).catch(() => {});
-  await sleep(2500);
+  await waitForProcessingEnd(page);
+  await waitTableChangeAnyFrame(page, beforeSignature);
+  await sleep(1200);
+
+  const afterSignature = await readTableSignature(page).catch(() => '');
+  if (!afterSignature) {
+    throw new Error('Filtro aplicado, mas não encontrei a tabela de resultado. Confira o seletor do relatório.');
+  }
+}
+
+async function waitForProcessingEnd(page) {
+  const started = Date.now();
+  while (Date.now() - started < 30000) {
+    const loading = await page.evaluate(() => {
+      const visible = el => !!(el && el.getClientRects().length);
+      const txt = el => (el?.innerText || el?.textContent || '').toLowerCase();
+      return Array.from(document.querySelectorAll('.dataTables_processing,.loading,.loader,.overlay,.blockUI'))
+        .some(el => visible(el) && /processando|carregando|aguarde|loading/.test(txt(el)));
+    }).catch(() => false);
+    if (!loading) return true;
+    await sleep(500);
+  }
+  return false;
+}
+
+async function readTableSignature(page) {
+  for (const frame of page.frames()) {
+    const sig = await frame.evaluate(() => {
+      const text = el => (el?.innerText || el?.textContent || '').replace(/\s+/g, ' ').trim();
+      const table = Array.from(document.querySelectorAll('table'))
+        .filter(t => t.getClientRects().length)
+        .sort((a, b) => b.querySelectorAll('tbody td').length - a.querySelectorAll('tbody td').length)[0];
+      if (!table) return '';
+      const rows = Array.from(table.querySelectorAll('tbody tr')).map(tr => Array.from(tr.querySelectorAll('td,th')).map(text));
+      return rows.slice(0, 3).map(r => r.join('|')).join('§') + `#${rows.length}`;
+    }).catch(() => '');
+    if (sig) return sig;
+  }
+  return '';
+}
+
+async function waitTableChangeAnyFrame(page, previousSignature) {
+  if (!previousSignature) {
+    await sleep(1000);
+    return true;
+  }
+  const started = Date.now();
+  while (Date.now() - started < 30000) {
+    await sleep(700);
+    const sig = await readTableSignature(page).catch(() => '');
+    if (sig && sig !== previousSignature) return true;
+  }
+  // Não falha aqui porque alguns filtros podem manter a primeira linha igual; a captura ainda continua.
+  return false;
 }
 
 async function fillDateRange(page, selectors, value, label) {
@@ -733,12 +822,14 @@ async function captureAllPages(page, update, started = Date.now()) {
   let paginasCapturadas = 0;
   const seen = new Set();
   let lastSignature = '';
+  let totalPages = 0;
+  let totalExpected = 0;
 
   for (let pageNumber = 1; pageNumber <= 250; pageNumber++) {
     const source = await bestTableSource(page);
     if (!source) break;
 
-    const extracted = await source.frame.evaluate(() => {
+    const extracted = await source.frame.evaluate((linhasPorPagina) => {
       const text = el => (el?.innerText || el?.textContent || '').replace(/\s+/g, ' ').trim();
       const visible = el => !!(el && el.getClientRects().length);
       const tables = Array.from(document.querySelectorAll('table'))
@@ -746,18 +837,43 @@ async function captureAllPages(page, update, started = Date.now()) {
         .map(t => ({ table: t, cells: t.querySelectorAll('tbody td').length, len: text(t).length }))
         .sort((a, b) => (b.cells + b.len) - (a.cells + a.len));
       const table = tables[0]?.table;
-      if (!table) return { headers: [], rows: [], signature: '' };
+      if (!table) return { headers: [], rows: [], signature: '', totalPages: 0, totalRecords: 0 };
 
       let headers = Array.from(table.querySelectorAll('thead tr:last-child th')).map(text).filter(Boolean);
       const rows = Array.from(table.querySelectorAll('tbody tr')).map(tr => Array.from(tr.querySelectorAll('td,th')).map(text))
         .filter(r => r.length && r.some(c => c) && !/nenhum registro|no matching records|carregando|processando/i.test(r.join(' ')));
       if (!headers.length && rows[0]) headers = rows[0].map((_, i) => `Coluna ${i + 1}`);
       const signature = rows.slice(0, 3).map(r => r.join('|')).join('§') + `#${rows.length}`;
-      return { headers, rows, signature };
-    });
+
+      const pageText = text(document.body);
+      const parseNumber = v => Number(String(v || '').replace(/\./g, '').replace(',', '.').replace(/[^0-9.]/g, '')) || 0;
+      let totalRecords = 0;
+
+      const patterns = [
+        /de\s+([\d\.]+)\s+registros/i,
+        /total\s+de\s+([\d\.]+)\s+registros/i,
+        /([\d\.]+)\s+registros\s+no\s+total/i,
+        /filtered\s+from\s+([\d\.]+)\s+total/i
+      ];
+      for (const p of patterns) {
+        const m = pageText.match(p);
+        if (m) { totalRecords = parseNumber(m[1]); break; }
+      }
+
+      let totalPages = totalRecords ? Math.max(1, Math.ceil(totalRecords / linhasPorPagina)) : 0;
+      const pageNumbers = Array.from(document.querySelectorAll('.paginate_button, .pagination a, .pagination button, a, button'))
+        .map(el => text(el))
+        .filter(v => /^\d+$/.test(v))
+        .map(Number);
+      if (pageNumbers.length) totalPages = Math.max(totalPages, Math.max(...pageNumbers));
+
+      return { headers, rows, signature, totalPages, totalRecords };
+    }, LINHAS_POR_PAGINA);
 
     if (!extracted.rows.length && pageNumber === 1) break;
     if (!headers.length && extracted.headers.length) headers = extracted.headers;
+    if (extracted.totalPages) totalPages = extracted.totalPages;
+    if (extracted.totalRecords) totalExpected = extracted.totalRecords;
 
     let added = 0;
     for (const arr of extracted.rows) {
@@ -771,17 +887,20 @@ async function captureAllPages(page, update, started = Date.now()) {
     }
 
     paginasCapturadas++;
+    const currentTotalPages = totalPages || 0;
     update({
-      step: `Coletando página ${pageNumber}`,
-      progress: Math.min(92, 45 + Math.round(pageNumber * 2)),
+      step: `Coletando página ${pageNumber}${currentTotalPages ? ` de ${currentTotalPages}` : ''}`,
+      progress: currentTotalPages ? Math.min(92, 45 + Math.round((pageNumber / currentTotalPages) * 47)) : Math.min(90, 45 + Math.round(pageNumber * 2)),
       paginaAtual: pageNumber,
-      totalPaginas: 0,
+      totalPaginas: currentTotalPages,
       registrosLidos: rows.length,
       linhasPorPagina: LINHAS_POR_PAGINA,
       velocidadeMedia: averagePageSpeed(started, pageNumber),
-      tempoEstimadoRestante: '--',
-      log: `Página ${pageNumber}: ${added} linhas capturadas.`
+      tempoEstimadoRestante: currentTotalPages ? estimateRemaining(started, pageNumber, currentTotalPages) : '--',
+      log: `Página ${pageNumber}${currentTotalPages ? ` de ${currentTotalPages}` : ''}: ${added} linhas capturadas.`
     });
+
+    if (currentTotalPages && pageNumber >= currentTotalPages) break;
 
     const moved = await clickNext(source.frame);
     if (!moved) break;
@@ -790,7 +909,7 @@ async function captureAllPages(page, update, started = Date.now()) {
     lastSignature = extracted.signature;
   }
 
-  return { rows, headers, paginasCapturadas };
+  return { rows, headers, paginasCapturadas, totalExpected };
 }
 
 async function bestTableSource(page) {
