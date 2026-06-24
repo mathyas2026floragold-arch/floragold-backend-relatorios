@@ -57,7 +57,7 @@ Para relatório verídico:
 - `EXPORT_MODE=native`
 
 
-## v11 - Relatório verídico obrigatório
+## v12 - Relatório verídico obrigatório
 
 Esta versão não gera relatório simulado. Para baixar relatório real, configure no Render:
 
@@ -66,9 +66,15 @@ DEMO_MODE=false
 EXPORT_MODE=native
 ```
 
-Regras da v11:
+Regras da v12:
 - O robô deve aplicar o filtro de data antes de exportar.
 - O robô prioriza o botão Excel/CSV nativo do FloraGold.
 - Telefone, protocolo, origem, operador, data e hora nunca são inventados.
 - Se `DEMO_MODE=true`, a geração de relatório é bloqueada com erro para evitar dados falsos.
 - O arquivo final só é aceito se tiver as colunas oficiais do relatório Entrante.
+
+
+## Ajuste v12
+- Front-end sem campos de hora.
+- Datas em texto `dd/mm/aaaa`, sem limite 2025/2027 e sem calendário nativo que falhava.
+- Backend continua aplicando o dia inteiro internamente: 00:00 até 23:59.
